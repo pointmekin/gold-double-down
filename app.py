@@ -320,11 +320,11 @@ initial_capital = st.sidebar.number_input(
 # Margin Level
 margin_level = st.sidebar.slider(
     "Margin Level (Leverage)",
-    min_value=0.5,
-    max_value=5.0,
+    min_value=1.0,
+    max_value=100.0,
     value=1.0,
-    step=0.1,
-    help="1.0 = no leverage (full cash), 2.0 = 2x leverage"
+    step=0.5,
+    help="1.0 = no leverage (full cash), 10.0 = 10x leverage, 100.0 = 100x leverage"
 )
 
 # Take Profit Section

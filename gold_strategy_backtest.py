@@ -459,31 +459,139 @@ class DoubleDownBacktester:
         return result
 
     def _calculate_risk_metrics(self) -> Tuple[float, Dict[float, float]]:
-        """Calculate liquidation price and risk of ruin scenarios."""
+        """Calculate liquidation price and risk of ruin scenarios.
+
+        Shows: At what price would you lose X% of your initial capital,
+        assuming you start buying from reference price and accumulate positions
+        as price drops according to your strategy settings.
+        """
         point_value = self.ticker_info["point_value"]
 
-        # Calculate at what price we'd lose a significant portion of capital
-        # Assuming we have max_positions at average entry
-        current_price = self.data["Close"].iloc[-1]
+        # Use the first price in the data as a reference starting point
+        reference_price = self.data["Close"].iloc[0]
 
-        # Simulate different price drop scenarios
         risk_levels = {
-            0.20: 0,  # 20% portfolio loss
-            0.50: 0,  # 50% portfolio loss
-            0.80: 0,  # 80% portfolio loss
-            1.00: 0,  # 100% portfolio loss (liquidation)
+            0.20: None,  # 20% portfolio loss
+            0.50: None,  # 50% portfolio loss
+            0.80: None,  # 80% portfolio loss
+            1.00: None,  # 100% portfolio loss (liquidation)
         }
 
-        # For max positions scenario
-        max_contracts = self.config.max_positions
-        avg_entry = current_price * 0.95  # Assume we entered 5% above current
+        # Build the complete list of buy levels we would hit as price drops
+        # This simulates: starting at reference_price, at what price levels would we buy?
+        buy_levels = []  # List of (buy_price, position_size)
 
-        for loss_pct in risk_levels.keys():
-            loss_amount = self.config.initial_capital * loss_pct
-            # Price move needed to cause this loss
-            # loss = (entry - price) * contracts * point_value * size
-            price_drop_needed = loss_amount / (max_contracts * point_value * self.config.position_size)
-            risk_levels[loss_pct] = current_price - price_drop_needed
+        current_price = reference_price
+        current_size = self.config.position_size
+
+        for i in range(self.config.max_positions):
+            # Add this buy level
+            buy_levels.append((current_price, current_size))
+
+            # Calculate next buy level
+            if self.config.enable_progressive_scaling and i > 0:
+                tier = (i) // self.config.scaling_interval
+                next_size = self.config.position_size * (self.config.position_size_multiplier ** tier)
+            else:
+                next_size = self.config.position_size
+
+            # Calculate price drop for next buy
+            if self.config.price_gap_type == PriceGapType.FIXED:
+                if self.config.enable_progressive_scaling:
+                    tier = (i) // self.config.scaling_interval
+                    gap = self.config.price_gap * (self.config.price_gap_multiplier ** tier)
+                else:
+                    gap = self.config.price_gap
+                next_price = current_price - gap
+            else:
+                if self.config.enable_progressive_scaling:
+                    tier = (i) // self.config.scaling_interval
+                    gap_pct = self.config.price_gap_pct * (self.config.price_gap_multiplier ** tier)
+                else:
+                    gap_pct = self.config.price_gap_pct
+                next_price = current_price * (1 - gap_pct)
+
+            current_price = next_price
+            current_size = next_size
+
+            # Stop if price would go negative
+            if current_price <= 0:
+                break
+
+        # Now calculate at what price we reach each loss level
+        # We need to consider that loss accumulates as we both:
+        # 1. Add more positions at higher prices
+        # 2. See existing positions lose more value as price drops
+
+        # For each target loss, find the price where cumulative loss = target
+        for target_loss_pct in risk_levels.keys():
+            target_loss_amount = self.config.initial_capital * target_loss_pct
+
+            # The loss at any price P is: sum((entry_price - P) * size * point_value) for all entries where entry_price >= trigger_price(P))
+            # where trigger_price(P) is the price at which we would have bought that position
+
+            # To find P, we iterate through price levels and check
+            found_price = None
+
+            # Check loss at each buy level (and between buy levels)
+            for i in range(len(buy_levels)):
+                # Loss if price drops to this buy level (including this position)
+                positions_at_this_level = buy_levels[:i+1]
+                price_at_this_level = buy_levels[i][0]
+
+                # Calculate unrealized loss at this price
+                total_loss = sum((entry - price_at_this_level) * size * point_value
+                                for entry, size in positions_at_this_level)
+
+                if total_loss >= target_loss_amount:
+                    # We found it! Interpolate for more precision
+                    if i == 0:
+                        # Between reference and first buy level
+                        found_price = reference_price - (target_loss_amount / (buy_levels[0][1] * point_value))
+                    else:
+                        # Between previous buy level and this one
+                        prev_price = buy_levels[i-1][0] if i > 0 else reference_price
+                        prev_positions = buy_levels[:i]
+
+                        # Loss at previous price level
+                        loss_at_prev = sum((entry - prev_price) * size * point_value
+                                          for entry, size in prev_positions)
+
+                        # Additional loss needed
+                        additional_loss_needed = target_loss_amount - loss_at_prev
+
+                        # Number of positions at this stage
+                        total_contracts = sum(size for _, size in prev_positions)
+
+                        if total_contracts > 0:
+                            price_drop_needed = additional_loss_needed / (total_contracts * point_value)
+                            found_price = prev_price - price_drop_needed
+                        else:
+                            found_price = price_at_this_level
+
+                    break
+
+            if found_price is not None and found_price > 0:
+                risk_levels[target_loss_pct] = found_price
+            else:
+                # Check if even max positions wouldn't reach this loss
+                # Calculate max possible loss (price goes to 0)
+                max_loss = sum(entry * size * point_value for entry, size in buy_levels)
+                if max_loss >= target_loss_amount:
+                    # Would reach this loss, solve for price
+                    # We need to find P where: sum((entry - P) * size * pv) = target
+                    # sum(entry * size * pv) - P * sum(size * pv) = target
+                    # P = (sum(entry * size * pv) - target) / sum(size * pv)
+                    total_entry_value = sum(entry * size * point_value for entry, size in buy_levels)
+                    total_contracts = sum(size for _, size in buy_levels)
+                    if total_contracts * point_value > 0:
+                        found_price = (total_entry_value - target_loss_amount) / (total_contracts * point_value)
+                        risk_levels[target_loss_pct] = max(0, found_price)
+                    else:
+                        risk_levels[target_loss_pct] = 0.0
+                else:
+                    # Would never reach this loss level
+                    risk_levels[target_loss_pct] = 0.0
 
         return risk_levels[1.00], risk_levels
 
