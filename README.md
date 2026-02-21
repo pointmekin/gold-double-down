@@ -4,6 +4,9 @@ An interactive visualization tool for analyzing a "double-down" investment strat
 - Buy at fixed price intervals as price drops
 - Close all positions when a target profit percentage is reached
 
+<img width="2672" height="1436" alt="Screenshot 2569-02-21 at 13 24 33" src="https://github.com/user-attachments/assets/37cd48f5-a4d4-448e-a608-e0658c95c4d0" />
+
+
 ## Features
 
 - **Configurable Parameters**:
